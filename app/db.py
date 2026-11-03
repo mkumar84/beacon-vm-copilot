@@ -6,8 +6,11 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 def _database_url() -> str:
     url = os.getenv("DATABASE_URL", "sqlite:///./beacon.db")
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
+    # Pin the psycopg2 driver: SQLAlchemy 2.1 defaults bare postgresql:// to psycopg3.
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            url = "postgresql+psycopg2://" + url[len(prefix):]
+            break
     return url
 
 
