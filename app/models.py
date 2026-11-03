@@ -188,3 +188,10 @@ class Snapshot(Base):
     sla_pct: Mapped[float] = mapped_column(Float)
     kev_open: Mapped[int] = mapped_column(Integer)
     ext_rating: Mapped[float] = mapped_column(Float)
+
+
+class Meta(Base):
+    """Key/value bookkeeping, e.g. when the demo data was last seeded."""
+    __tablename__ = "meta"
+    key: Mapped[str] = mapped_column(String(40), primary_key=True)
+    value: Mapped[str] = mapped_column(String(200))

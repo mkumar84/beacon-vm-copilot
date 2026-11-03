@@ -1,5 +1,8 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager
+
+from datetime import timedelta
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,20 +14,46 @@ from sqlalchemy.orm import Session
 from . import governance, reports, zeroday
 from .db import Base, SessionLocal, engine, get_db
 from .models import Asset, AuditEntry, Finding, Intel, Proposal, ZeroDayEvent, iso, now
-from .seed import seed
+from .seed import reset_and_seed, seed, seeded_at
 
 DISCLAIMER = ("Maple & Main Retail is fictional. All assets, findings, owners and threat-intel flags are synthetic; "
               "CVE identifiers are real for readability. This product prioritizes and governs; it never scans or exploits.")
+
+
+# Demo data is relative to "now", so it ages (feeds go stale, approvals pile up) and a visitor can
+# empty the approvals inbox. Reset it on a schedule. DEMO_RESET_HOURS=0 disables (data then ages).
+DEMO_RESET_HOURS = float(os.getenv("DEMO_RESET_HOURS", "12"))
+
+
+def _refresh_demo_if_stale():
+    """Seed an empty database, or reset demo data older than DEMO_RESET_HOURS."""
+    with SessionLocal() as db:
+        empty = db.execute(select(func.count(Asset.id))).scalar() == 0
+        stamp = seeded_at(db)
+        stale = DEMO_RESET_HOURS > 0 and (stamp is None or (now() - stamp).total_seconds() > DEMO_RESET_HOURS * 3600)
+        if empty or stale:
+            reset_and_seed(db)
+            reports._brief_cache.update(ts=0, data=None)
+
+
+async def _demo_reset_loop():
+    while True:
+        await asyncio.sleep(600)
+        try:
+            await asyncio.to_thread(_refresh_demo_if_stale)
+        except Exception as exc:  # keep serving even if a reset fails
+            print(f"demo reset failed: {exc}", flush=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
     if os.getenv("AUTO_SEED", "true").lower() == "true":
-        with SessionLocal() as db:
-            if db.execute(select(func.count(Asset.id))).scalar() == 0:
-                seed(db)
+        await asyncio.to_thread(_refresh_demo_if_stale)
+    task = asyncio.create_task(_demo_reset_loop()) if DEMO_RESET_HOURS > 0 else None
     yield
+    if task:
+        task.cancel()
 
 
 app = FastAPI(title="Beacon: Vulnerability Management Copilot", version="1.0.0", lifespan=lifespan,
@@ -72,7 +101,19 @@ def root():
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     n = db.execute(select(func.count(Finding.id))).scalar()
-    return {"status": "ok", "findings": n, "time": iso(now())}
+    return {"status": "ok", "findings": n, "time": iso(now())} | _demo_info(db)
+
+
+def _demo_info(db):
+    stamp = seeded_at(db)
+    nxt = stamp + timedelta(hours=DEMO_RESET_HOURS) if (stamp and DEMO_RESET_HOURS > 0) else None
+    return {"demo_seeded_at": iso(stamp), "demo_next_reset_at": iso(nxt), "demo_reset_every_hours": DEMO_RESET_HOURS}
+
+
+@app.get("/api/demo")
+def demo_info(db: Session = Depends(get_db)):
+    """When the synthetic data was generated and when it will next reset."""
+    return _demo_info(db)
 
 
 @app.get("/api/scorecard")
@@ -309,9 +350,7 @@ def reseed(x_admin_token: str | None = Header(default=None)):
     token = os.getenv("ADMIN_TOKEN")
     if not token or x_admin_token != token:
         raise HTTPException(403, "Reseed disabled or token invalid")
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
     with SessionLocal() as db:
-        result = seed(db)
+        result = reset_and_seed(db)
     reports._brief_cache.update(ts=0, data=None)
     return {"status": "reseeded", **result}

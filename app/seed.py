@@ -7,10 +7,11 @@ scenario uses a fictional CVE and component.
 import random
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from .governance import audit, decide, ingest_finding
-from .models import (Asset, Finding, Intel, Pentest, Proposal, ScanSource, Snapshot, now)
+from .models import (Asset, AuditEntry, Finding, Intel, Meta, Pentest, Proposal, ScanSource, Snapshot,
+                     ZeroDayEvent, now)
 from .scoring import SLA_DAYS
 
 ANALYSTS = ["a.okafor", "j.tremblay", "p.sharma", "m.lefebvre"]
@@ -155,10 +156,11 @@ def seed(db, rng=None):
     now_dt = now()
 
     # --- scan sources (platform health)
-    sources = [("internal_scan", "Internal network scanner", 20, 24, 38), ("external_scan", "External attack-surface scanner", 14, 24, 9),
-               ("db_scan", "Database configuration scanner", 9 * 24 + 6, 72, 4), ("sast", "Static code analysis", 30, 24, 14),
-               ("dast", "Dynamic application testing", 40, 48, 8), ("sca", "Software composition analysis", 26, 24, 22),
-               ("mobile", "Mobile app analysis", 3 * 24, 168, 2)]
+    # Healthy feeds are seeded recently enough to stay healthy until the next demo reset (12h by default).
+    sources = [("internal_scan", "Internal network scanner", 6, 24, 38), ("external_scan", "External attack-surface scanner", 4, 24, 9),
+               ("db_scan", "Database configuration scanner", 9 * 24 + 6, 72, 4), ("sast", "Static code analysis", 8, 24, 14),
+               ("dast", "Dynamic application testing", 20, 48, 8), ("sca", "Software composition analysis", 7, 24, 22),
+               ("mobile", "Mobile app analysis", 2 * 24, 168, 2)]
     for name, label, hrs, every, cov in sources:
         db.add(ScanSource(name=name, label=label, last_ingest_at=now_dt - timedelta(hours=hrs),
                           expected_every_hours=every, assets_covered=cov))
@@ -200,6 +202,22 @@ def seed(db, rng=None):
         created.append((f, a, True))
         fresh_keys.add((an, cve))
 
+    # --- planted story: approved P0s stuck with Store Systems Ops under the holiday change freeze.
+    # Planted explicitly (not left to chance) so the SLA-breach story is stable and deterministic.
+    stuck_pairs = [("pos-region-west", "CVE-2019-0708", 12), ("pos-region-central", "CVE-2019-0708", 19),
+                   ("pos-region-north", "CVE-2019-0708", 26)]
+    for (an, cve, days) in stuck_pairs:
+        a = by_name[an]
+        v = vuln_by_cve[cve]
+        f = make(a, v[1], v[2], cve, _source_for(a, "cve"), now_dt - timedelta(days=days))
+        created.append((f, a, True))  # True: skip random remediation, it stays open
+        fresh_keys.add((an, cve))
+        prop = db.execute(select(Proposal).where(Proposal.finding_id == f.id,
+                                                 Proposal.status == "pending")).scalar_one()
+        decide(db, prop, "approve", "a.okafor", "Confirmed exposure with owner; declaring P0",
+               f.first_seen + timedelta(hours=4))
+        f.status = "in_remediation"
+
     # --- general population
     for a in assets:
         p = 0.9 if a.name in {k[0] for k in KEY_ASSETS} else 0.65
@@ -223,7 +241,8 @@ def seed(db, rng=None):
                          now_dt - timedelta(days=21)), a, False))
 
     # --- human decisions on P0 candidates (older ones decided; fresh ones stay pending)
-    pending_p0 = db.execute(select(Proposal).where(Proposal.status == "pending")).scalars().all()
+    # Explicit ORDER BY: SQLite and Postgres return unordered rows differently, and this loop consumes random draws.
+    pending_p0 = db.execute(select(Proposal).where(Proposal.status == "pending").order_by(Proposal.id)).scalars().all()
     for p in pending_p0:
         f = db.get(Finding, p.finding_id)
         age_h = (now_dt - f.first_seen).total_seconds() / 3600
@@ -305,5 +324,19 @@ def seed(db, rng=None):
                         sla_pct=round(min(99, max(40, cur["sla_pct"] - 18 * k + rng.uniform(-2, 2))), 1),
                         kev_open=max(0, int(round(cur["kev_open"] + 7 * k + rng.uniform(-1, 1)))),
                         ext_rating=round(min(99, max(30, cur["ext_rating"] - 14 * k + rng.uniform(-2, 2))), 1)))
+    db.merge(Meta(key="seeded_at", value=now_dt.isoformat()))
     db.commit()
     return {"assets": len(assets), "findings": len(created) + 1}
+
+
+def reset_and_seed(db):
+    """Replace all demo data in ONE transaction: readers keep seeing the old data until commit."""
+    for model in (Proposal, AuditEntry, Pentest, ZeroDayEvent, Snapshot, Finding, ScanSource, Intel, Asset, Meta):
+        db.execute(delete(model))
+    db.info.pop("audit_head", None)
+    return seed(db)
+
+
+def seeded_at(db):
+    row = db.get(Meta, "seeded_at")
+    return datetime.fromisoformat(row.value) if row else None
